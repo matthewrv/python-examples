@@ -32,10 +32,14 @@ class RateCounter:
         self._counter_lock = threading.Lock()
         self._counter: dict[str, LockedQueue] = {}
 
-        rate_period = 10
-        self._delta = timedelta(minutes=-rate_period)
+        rate_period = 1
+        self._delta = timedelta(seconds=-rate_period)
+
+        self._total_counter_lock = threading.Lock()
+        self._total_counter = 0
 
     def _get_queue(self, id_: str) -> LockedQueue:
+        # prevent race condition on inserting two different queues with same key
         with self._counter_lock:
             queue = self._counter.setdefault(id_, LockedQueue())
             return queue
@@ -43,21 +47,17 @@ class RateCounter:
     def add_request(self, id_: str, timestamp: datetime):
         locked_queue = self._get_queue(id_)
         queue, lock = locked_queue.queue, locked_queue.lock
-        with lock:  # <-- try commenting this line and you will get race condition
-            if not queue:
-                queue.append(timestamp)
-                return
-
-            if queue[-1] <= timestamp:
-                queue.append(timestamp)
-                return
-
+        with lock:  # <-- try commenting this line and you will get race condition on queue iteration
+            insert_pos = 0
             for i, value in enumerate(reversed(queue)):
                 if timestamp >= value:
-                    queue.insert(len(queue) - i, timestamp)
-                    return
+                    insert_pos = len(queue) - i
+                    break
 
-            queue.appendleft(timestamp)
+            queue.insert(insert_pos, timestamp)
+
+            with self._total_counter_lock:
+                self._total_counter += 1
 
     def get_count(self, id_: str) -> int:
         locked_queue = self._get_queue(id_)
@@ -78,10 +78,13 @@ class RateCounter:
         for key in keys_snapshot:
             locked_queue = self._get_queue(key)
             queue, lock = locked_queue.queue, locked_queue.lock
-            with lock:
+            with lock:  # <-- try commenting this line and you will get race condition on queue iteration
                 timestamps_since = datetime.now() + self._delta
                 while queue and queue[0] < timestamps_since:
                     queue.popleft()
+
+    def get_total_count(self):
+        return self._total_counter
 
 
 async def main():
@@ -89,8 +92,8 @@ async def main():
 
     errors = deque()
     stop_measures = threading.Event()
-    measure_interval = 0.1
-    clean_interval = 0.05
+    measure_interval = 0.100  # 100ms
+    clean_interval = 0.050  #  50ms
 
     producers = [
         threading.Thread(target=gen_requests, args=(counter, errors)),
@@ -127,18 +130,13 @@ async def main():
     while errors:
         print("Error:", errors.pop())
 
-    total = 0
-    for id_ in ids:
-        count = counter.get_count(id_)
-        total += count
-        print(f"Final count for {id_} is:", count)
-    print("Total number of requests is", total)
+    print("Total number of requests is", counter.get_total_count())
 
 
 def gen_requests(rate_counter: RateCounter, errors: deque):
     try:
-        for _ in range(100000):
-            # use jitter to perform not only thread-safe appends, but also inserts
+        for _ in range(1000000):
+            # use jitter to perform not only thread-safe appends, but also inserts on queue
             id_ = random.choice(ids)
             rate_counter.add_request(id_, datetime.now() + _jitter())
     except Exception as exc:
